@@ -1,10 +1,14 @@
 import argparse
 import os
+import cv2
 
 # Import the helper from the local module (lowercase filename).
-from ImageDetect import image_to_2d_array
-from algorithm_utils import ImageAlgorithms
-from display_utils import DisplayUtils
+from old_approach.ImageDetect import image_to_2d_array
+from old_approach.algorithm_utils import ImageAlgorithms
+from old_approach.display_utils import DisplayUtils
+from old_approach.edge_matcher import StripMatcher
+from test import solve_puzzle
+
 
 
 def main() -> None:
@@ -43,11 +47,18 @@ def main() -> None:
 
     components = ImageAlgorithms.find_components(mask, pixels_2d)
 
-    print("component : 1", components[0].patch)
+    grid, result_image, score = solve_puzzle(
+        components,
+        rows=4,
+        cols=4,
+        time_limit=60
+    )
 
-    for component in components:
-        DisplayUtils.display_component_strips(component)
-    DisplayUtils.display_all_strips(components)
+    # Save or display result
+    cv2.imwrite('solved_puzzle.png', result_image)
+
+    # The grid array tells you which piece goes where
+    print(f"Piece arrangement:\n{grid}")
 
 
 if __name__ == "__main__":

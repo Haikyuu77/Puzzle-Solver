@@ -5,7 +5,7 @@ from PIL import Image
 from PIL.ImageDraw import ImageDraw
 from PIL.ImageFont import ImageFont
 
-from connected_component import ConnectedComponent
+from old_approach.connected_component import ConnectedComponent
 
 
 Pixel = Tuple[int, int, int]

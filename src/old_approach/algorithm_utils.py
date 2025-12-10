@@ -1,7 +1,7 @@
 from collections import deque
 from typing import Dict, List, Sequence, Tuple
 
-from connected_component import ConnectedComponent, Coord
+from old_approach.connected_component import ConnectedComponent, Coord
 
 Pixel = Tuple[int, int, int]
 DEFAULT_THRESHOLD = 10
