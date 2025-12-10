@@ -1,260 +1,380 @@
 import cv2
 import numpy as np
-import math
+import os
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-INPUT_IMAGE = '../images/mona_lisa_translate.png'
-GRID_SIZE = 4            # 4x4 = 16 pieces
-ANIMATION_SPEED = 0.05
-WINDOW_SIZE = (800, 800)
-CROP_PIXELS = 4          # CRITICAL: Removes black artifacts from edges
+# Make sure this path is correct relative to where you run the script
+INPUT_IMAGE = '../images/starry_night_rotate.png' 
+
+# Settings
+MATCH_CROP = 2          # Remove 2px borders for math (avoids black lines)
+MATCH_SIZE = 64         # Fixed size for mathematical comparison only
+DISPLAY_CROP = 0        # 0 = Show full original piece, 1 = Trim edge
 
 class PuzzlePiece:
-    def __init__(self, original_img, straight_img, center, angle):
+    def __init__(self, original_img, straight_img, center, angle, idx):
+        self.id = idx
         self.original_view = original_img
-        # Crop the image to remove black interpolation artifacts
-        h, w = straight_img.shape[:2]
-        self.image = straight_img[CROP_PIXELS:h-CROP_PIXELS, CROP_PIXELS:w-CROP_PIXELS]
+        self.center = center
+        self.detected_angle = angle
         
-        # Resize to standard block size (e.g., 100x100) for consistent matching
-        self.image = cv2.resize(self.image, (100, 100))
+        # Base straightened image (Original Resolution)
+        base = straight_img
         
-        self.id = -1
+        # 1. GENERATE 4 ORIENTATIONS (0, 90, 180, 270)
+        self.rotations = [] 
+        
+        current_img = base
+        for r in range(4):
+            # Dimensions of this specific rotation
+            h, w = current_img.shape[:2]
+            
+            # Prepare Math Image (LAB Color Space)
+            # We resize a copy to small square for consistent math
+            # but we keep 'visual' as the original high-res shape
+            safe = current_img[MATCH_CROP:h-MATCH_CROP, MATCH_CROP:w-MATCH_CROP]
+            if safe.size == 0: safe = current_img # Fallback for tiny pieces
+            
+            small = cv2.resize(safe, (MATCH_SIZE, MATCH_SIZE))
+            lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB).astype("float32")
+            
+            self.rotations.append({
+                'visual': current_img, # High-Res Display
+                'lab': lab,            # Low-Res Math
+                'h': h,                
+                'w': w
+            })
+            
+            # Rotate 90 degrees for next iteration
+            current_img = cv2.rotate(current_img, cv2.ROTATE_90_CLOCKWISE)
+
+        # Calculate Variance on the base image
+        self.variance = np.std(self.rotations[0]['lab'][:,:,0])
+        
+        # Animation State
+        self.final_rotation_idx = 0 
         self.current_x = center[0]
         self.current_y = center[1]
-        self.current_angle = angle
         self.target_x = 0
         self.target_y = 0
-        self.h, self.w = self.image.shape[:2]
 
-        # Pre-compute LAB color space for better human-eye matching
-        self.lab_image = cv2.cvtColor(self.image, cv2.COLOR_BGR2LAB).astype("float32")
-
-    def get_edge_data(self, side):
-        """
-        Returns the outer edge pixels AND the inner neighbor pixels 
-        to calculate gradients.
-        """
-        if side == 'top':    
-            return self.lab_image[0, :, :], self.lab_image[1, :, :]
-        if side == 'bottom': 
-            return self.lab_image[-1, :, :], self.lab_image[-2, :, :]
-        if side == 'left':   
-            return self.lab_image[:, 0, :], self.lab_image[:, 1, :]
-        if side == 'right':  
-            return self.lab_image[:, -1, :], self.lab_image[:, -2, :]
+    def get_edge_data(self, rot_idx, side):
+        lab = self.rotations[rot_idx]['lab']
+        if side == 'top':    return lab[0,:,:], lab[1,:,:]
+        if side == 'bottom': return lab[-1,:,:], lab[-2,:,:]
+        if side == 'left':   return lab[:,0,:], lab[:,1,:]
+        if side == 'right':  return lab[:,-1,:], lab[:,-2,:]
 
 # ==========================================
-# 1. PRE-PROCESSING
+# 1. EXTRACT PIECES (PRESERVE SIZE)
 # ==========================================
 def extract_pieces(image_path):
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found at: {image_path}")
+
     img = cv2.imread(image_path)
-    if img is None: raise FileNotFoundError("Image not found")
+    if img is None: raise ValueError("Could not load image (check format).")
     
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    pieces = []
-    print(f"Detecting pieces... Found {len(contours)} contours.")
-    
-    for i, cnt in enumerate(contours):
+    raw_pieces = []
+    for cnt in contours:
         if cv2.contourArea(cnt) < 1000: continue
-        
-        # De-rotate
         rect = cv2.minAreaRect(cnt)
+        
         box = np.int64(cv2.boxPoints(rect))
-        
-        # Sort corners: TL, TR, BR, BL
         pts = box.astype("float32")
-        pts = pts[np.argsort(pts[:, 1])] # Sort by Y
-        top, bottom = pts[:2], pts[2:]
-        top = top[np.argsort(top[:, 0])] # Sort by X
-        bottom = bottom[np.argsort(bottom[:, 0])]
+        pts = pts[np.argsort(pts[:,1])]
+        top, bot = pts[:2], pts[2:]
+        top = top[np.argsort(top[:,0])]
+        bot = bot[np.argsort(bot[:,0])]
         
-        # Warp
-        w_rect, h_rect = int(rect[1][0]), int(rect[1][1])
-        if w_rect < h_rect: w_rect, h_rect = h_rect, w_rect # Ensure landscape logic
+        w_rect = int(np.linalg.norm(top[1]-top[0]))
+        h_rect = int(np.linalg.norm(bot[0]-top[0]))
         
-        dst_pts = np.array([[0,0], [w_rect-1, 0], [w_rect-1, h_rect-1], [0, h_rect-1]], dtype="float32")
-        src_pts = np.array([top[0], top[1], bottom[1], bottom[0]], dtype="float32")
+        src = np.array([top[0], top[1], bot[1], bot[0]], dtype="float32")
+        dst = np.array([[0,0], [w_rect-1,0], [w_rect-1,h_rect-1], [0,h_rect-1]], dtype="float32")
+        warped = cv2.warpPerspective(img, cv2.getPerspectiveTransform(src, dst), (w_rect, h_rect))
         
-        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        warped = cv2.warpPerspective(img, M, (w_rect, h_rect))
-        
-        p = PuzzlePiece(img, warped, rect[0], rect[2])
-        p.id = i
-        pieces.append(p)
+        raw_pieces.append({'img': warped, 'center': rect[0], 'angle': rect[2]})
 
-    return pieces, img.shape
+    if not raw_pieces: return [], img.shape
+
+    # Normalize to Median Dimension (Standardize grid size)
+    avg_w = int(np.median([p['img'].shape[1] for p in raw_pieces]))
+    avg_h = int(np.median([p['img'].shape[0] for p in raw_pieces]))
+    
+    print(f"Detected Piece Resolution: {avg_w}x{avg_h} px")
+    
+    final_pieces = []
+    for i, p in enumerate(raw_pieces):
+        # Resize to standard grid dimensions to fix minor extraction noise
+        resized = cv2.resize(p['img'], (avg_w, avg_h))
+        final_pieces.append(PuzzlePiece(img, resized, p['center'], p['angle'], i))
+        
+    return final_pieces, img.shape
 
 # ==========================================
-# 2. ADVANCED MATCHING METRIC
+# 2. ADAPTIVE METRIC
 # ==========================================
-def calculate_match_score(p1, p2, side_p1):
-    """
-    Calculates score between P1 and P2. Lower is better.
-    side_p1: 'right' means we compare P1's Right to P2's Left.
-    """
-    if side_p1 == 'right':
-        edge1, inner1 = p1.get_edge_data('right')
-        edge2, inner2 = p2.get_edge_data('left')
-    elif side_p1 == 'bottom':
-        edge1, inner1 = p1.get_edge_data('bottom')
-        edge2, inner2 = p2.get_edge_data('top')
-    
-    # 1. Color Difference (Euclidean distance in LAB)
-    # We compare the average of the edge and the inner pixel to smooth noise
-    val1 = (edge1 + inner1) / 2.0
-    val2 = (edge2 + inner2) / 2.0
-    
-    diff = np.linalg.norm(val1 - val2, axis=1)
-    color_score = np.mean(diff)
-    
-    # 2. Penalize matching dark edges to dark edges? 
-    # (Optional: prevents the "black border" trap if crop didn't work)
-    # If both edges are very dark (L < 10), add penalty
-    # avg_L = (np.mean(val1[:,0]) + np.mean(val2[:,0])) / 2
-    # if avg_L < 20: color_score += 50 
-    
-    return color_score
+def analyze_roughness(pieces):
+    total_var = sum(p.variance for p in pieces)
+    avg = total_var / len(pieces)
+    print(f"Image Roughness: {avg:.2f}")
+    if avg > 40: return {'grad': 1.5, 'dark': False} # Starry Night
+    else:        return {'grad': 0.5, 'dark': True}  # Mona Lisa
 
-def solve_puzzle_robust(pieces):
+def calculate_score(p1, rot1, p2, rot2, relation, config):
+    # 1. ASPECT RATIO CHECK
+    d1 = p1.rotations[rot1]
+    d2 = p2.rotations[rot2]
+    
+    # Tolerance for size mismatch (in pixels)
+    tol = 5 
+    
+    if relation == 'h':
+        # Matching Left-Right: Heights must match
+        if abs(d1['h'] - d2['h']) > tol: return float('inf')
+    else:
+        # Matching Top-Bottom: Widths must match
+        if abs(d1['w'] - d2['w']) > tol: return float('inf')
+
+    # 2. METRIC
+    if relation == 'h': 
+        edge1, inner1 = p1.get_edge_data(rot1, 'right')
+        edge2, inner2 = p2.get_edge_data(rot2, 'left')
+    else: 
+        edge1, inner1 = p1.get_edge_data(rot1, 'bottom')
+        edge2, inner2 = p2.get_edge_data(rot2, 'top')
+
+    color_err = np.linalg.norm(edge1 - edge2)
+    
+    pred_1 = edge1 + (edge1 - inner1)
+    pred_2 = edge2 + (edge2 - inner2)
+    grad_err = np.linalg.norm(pred_1 - edge2) + np.linalg.norm(pred_2 - edge1)
+    
+    score = color_err + (config['grad'] * grad_err)
+    
+    if config['dark']:
+        lum = (np.mean(edge1[:,0]) + np.mean(edge2[:,0])) / 2.0
+        if lum < 15: score *= 3.0
+        
+    return score
+
+# ==========================================
+# 3. GLOBAL SOLVER
+# ==========================================
+def solve_puzzle(pieces):
     n = len(pieces)
     grid_n = int(np.sqrt(n))
+    config = analyze_roughness(pieces)
     
-    # Precompute all pairwise scores
-    # [i][j] = Score if J is to the RIGHT of I
-    right_scores = np.full((n, n), np.inf)
-    # [i][j] = Score if J is BELOW I
-    down_scores = np.full((n, n), np.inf)
+    print("Computing compatibility matrix...")
+    costs = np.full((n, 4, n, 4, 2), float('inf'))
     
-    print("Calculating compatibility matrix...")
     for i in range(n):
         for j in range(n):
             if i == j: continue
-            right_scores[i][j] = calculate_match_score(pieces[i], pieces[j], 'right')
-            down_scores[i][j] = calculate_match_score(pieces[i], pieces[j], 'bottom')
-            
-    best_layout = None
-    min_global_error = float('inf')
+            for r1 in range(4):
+                for r2 in range(4):
+                    costs[i][r1][j][r2][0] = calculate_score(pieces[i], r1, pieces[j], r2, 'h', config)
+                    costs[i][r1][j][r2][1] = calculate_score(pieces[i], r1, pieces[j], r2, 'v', config)
+
+    print("Running Global Search...")
+    best_grid = None
+    min_score = float('inf')
     
-    # Try creating a grid starting with EVERY piece as the top-left corner
-    # The real solution will have the lowest Total Error Score
-    for start_node in range(n):
-        used = {start_node}
-        layout = [-1] * n
-        layout[0] = start_node
-        current_error = 0
-        
-        valid = True
-        
-        # Fill grid raster-style
-        for pos in range(1, n):
-            row = pos // grid_n
-            col = pos % grid_n
+    # Global Search
+    for start_p in range(n):
+        for start_r in range(4):
+            grid = [-1] * n
+            grid[0] = (start_p, start_r)
+            used = {start_p}
+            total_score = 0
+            valid = True
             
-            best_next = -1
-            best_local_score = float('inf')
-            
-            left_neighbor = layout[pos - 1] if col > 0 else -1
-            top_neighbor  = layout[pos - grid_n] if row > 0 else -1
-            
-            # Check all unused pieces for this slot
-            for candidate in range(n):
-                if candidate in used: continue
+            for pos in range(1, n):
+                r = pos // grid_n
+                c = pos % grid_n
+                left = grid[pos-1] if c > 0 else None
+                top  = grid[pos-grid_n] if r > 0 else None
                 
-                score = 0
-                div = 0
+                best_match = None
+                best_s = float('inf')
                 
-                if left_neighbor != -1:
-                    score += right_scores[left_neighbor][candidate]
-                    div += 1
-                if top_neighbor != -1:
-                    score += down_scores[top_neighbor][candidate]
-                    div += 1
+                for cp in range(n):
+                    if cp in used: continue
+                    for cr in range(4):
+                        s = 0
+                        cnt = 0
+                        if left:
+                            s += costs[left[0]][left[1]][cp][cr][0]
+                            cnt += 1
+                        if top:
+                            s += costs[top[0]][top[1]][cp][cr][1]
+                            cnt += 1
+                        if cnt > 0 and s < best_s:
+                            best_s = s
+                            best_match = (cp, cr)
                 
-                if div > 0:
-                    avg = score / div
-                    if avg < best_local_score:
-                        best_local_score = avg
-                        best_next = candidate
+                if best_match and best_s != float('inf'):
+                    grid[pos] = best_match
+                    used.add(best_match[0])
+                    total_score += best_s
+                    if total_score >= min_score: 
+                        valid = False
+                        break
+                else:
+                    valid = False
+                    break
             
-            if best_next != -1:
-                layout[pos] = best_next
-                used.add(best_next)
-                current_error += best_local_score
-            else:
-                valid = False
-                break
-        
-        if valid and current_error < min_global_error:
-            min_global_error = current_error
-            best_layout = layout
-            print(f"New best layout found (Error: {int(current_error)})")
-            
-    return best_layout
+            if valid and total_score < min_score:
+                min_score = total_score
+                best_grid = list(grid)
+                print(f"Best Grid: Start P{start_p} (Err: {int(min_score)})")
+
+    layout = [None] * n
+    for i, item in enumerate(best_grid):
+        layout[i] = item[0]
+        pieces[item[0]].final_rotation_idx = item[1]
+    return layout
 
 # ==========================================
-# 3. ANIMATION
+# 4. ANIMATION (With 2-Second Intro)
 # ==========================================
-def animate(pieces, layout, canvas_shape):
-    grid_n = int(np.sqrt(len(pieces)))
-    p_size = pieces[0].w # Assuming square/consistent
+# FIX: Removed unused 'canvas_shape' parameter
+def animate(pieces, layout):
+    # Determine Grid Size
+    n = len(pieces)
+    gw = int(np.sqrt(n))
     
-    # Setup target coordinates
-    margin_x = (canvas_shape[1] - (p_size * grid_n)) // 2
-    margin_y = (canvas_shape[0] - (p_size * grid_n)) // 2
+    # Get dimensions of a piece in the solved state
+    p0 = pieces[layout[0]]
+    ref_img = p0.rotations[p0.final_rotation_idx]['visual']
+    piece_h, piece_w = ref_img.shape[:2]
+    
+    # Calculate Final Canvas Size
+    final_w = piece_w * gw
+    final_h = piece_h * gw
+    
+    # Add a visual margin
+    margin = 100
+    canvas_w = final_w + (margin * 2)
+    canvas_h = final_h + (margin * 2)
+    
+    # Calculate Targets
+    grid_start_x = margin
+    grid_start_y = margin
     
     for i, idx in enumerate(layout):
-        r, c = i // grid_n, i % grid_n
-        pieces[idx].target_x = margin_x + (c * p_size) + p_size/2
-        pieces[idx].target_y = margin_y + (r * p_size) + p_size/2
+        r, c = i // gw, i % gw
+        pieces[idx].target_x = grid_start_x + (c * piece_w) + piece_w/2
+        pieces[idx].target_y = grid_start_y + (r * piece_h) + piece_h/2
+
+    # Shift Start Positions to Center (so the pile isn't off-screen)
+    all_x = [p.current_x for p in pieces]
+    all_y = [p.current_y for p in pieces]
+    center_x = (min(all_x) + max(all_x)) / 2
+    center_y = (min(all_y) + max(all_y)) / 2
+    shift_x = (canvas_w / 2) - center_x
+    shift_y = (canvas_h / 2) - center_y
+    for p in pieces:
+        p.current_x += shift_x
+        p.current_y += shift_y
+
+    base_canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
     
-    # Loop
-    base_canvas = np.zeros((canvas_shape[0], canvas_shape[1], 3), dtype=np.uint8)
-    frames = 60
-    
-    for t in range(frames + 30):
+    # --- HELPER: DRAW FRAME ---
+    def draw_state(ease_val):
         frame = base_canvas.copy()
-        alpha = min(t/frames, 1.0)
-        # Ease out cubic
-        ease = 1 - pow(1 - alpha, 3)
-        
         for p in pieces:
             # Interpolate
-            cx = p.current_x + (p.target_x - p.current_x) * ease
-            cy = p.current_y + (p.target_y - p.current_y) * ease
+            cx = p.current_x + (p.target_x - p.current_x) * ease_val
+            cy = p.current_y + (p.target_y - p.current_y) * ease_val
             
-            # Simple rotation visualization (fading rotation)
-            # To do real rotation, we need getRotationMatrix2D
-            M = cv2.getRotationMatrix2D((p.w/2, p.h/2), p.current_angle * (1-ease), 1.0)
-            cur_img = cv2.warpAffine(p.image, M, (p.w, p.h))
+            start_angle = p.detected_angle
+            end_angle = p.final_rotation_idx * -90
+            cur_angle = start_angle + (end_angle - start_angle) * ease_val
             
-            tl_x = int(cx - p.w/2)
-            tl_y = int(cy - p.h/2)
+            src_img = p.rotations[0]['visual']
+            h, w = src_img.shape[:2]
+            center = (w // 2, h // 2)
             
-            # Boundary check
-            h_img, w_img = cur_img.shape[:2]
-            if tl_y >= 0 and tl_x >= 0 and tl_y+h_img < canvas_shape[0] and tl_x+w_img < canvas_shape[1]:
-                frame[tl_y:tl_y+h_img, tl_x:tl_x+w_img] = cur_img
+            M = cv2.getRotationMatrix2D(center, cur_angle, 1.0)
+            abs_cos, abs_sin = abs(M[0,0]), abs(M[0,1])
+            new_w = int(h * abs_sin + w * abs_cos)
+            new_h = int(h * abs_cos + w * abs_sin)
+            M[0, 2] += new_w / 2 - center[0]
+            M[1, 2] += new_h / 2 - center[1]
+            
+            rot_img = cv2.warpAffine(src_img, M, (new_w, new_h))
+            
+            tl_x = int(cx - new_w / 2)
+            tl_y = int(cy - new_h / 2)
+            
+            ih, iw = rot_img.shape[:2]
+            x1 = max(tl_x, 0)
+            y1 = max(tl_y, 0)
+            x2 = min(tl_x + iw, canvas_w)
+            y2 = min(tl_y + ih, canvas_h)
+            
+            if x2 > x1 and y2 > y1:
+                ix1 = x1 - tl_x
+                iy1 = y1 - tl_y
+                ix2 = ix1 + (x2 - x1)
+                iy2 = iy1 + (y2 - y1)
+                
+                # Check bounds for source image slicing
+                if ix2 <= iw and iy2 <= ih:
+                    frame[y1:y2, x1:x2] = rot_img[iy1:iy2, ix1:ix2]
+        
+        # Smart Scaling for Display
+        disp_h, disp_w = frame.shape[:2]
+        MAX_DISPLAY = 900
+        if disp_h > MAX_DISPLAY:
+            scale = MAX_DISPLAY / disp_h
+            return cv2.resize(frame, (int(disp_w * scale), MAX_DISPLAY))
+        return frame
 
-        cv2.imshow("Solved", cv2.resize(frame, WINDOW_SIZE))
-        cv2.waitKey(20)
+    # --- STEP 1: SHOW ORIGINAL STATE (2 SECONDS) ---
+    print("Displaying original state...")
+    initial_view = draw_state(0.0) # Ease = 0 means original position
+    cv2.imshow("Puzzle Solver", initial_view)
+    cv2.waitKey(2000) # Freeze for 2000ms
+
+    # --- STEP 2: ANIMATE ---
+    print("Animating solution...")
+    total_frames = 300 
     
+    for t in range(total_frames):
+        alpha = min(t / (total_frames - 40), 1.0)
+        ease = 1 - pow(1 - alpha, 3)
+        
+        view = draw_state(ease)
+        cv2.imshow("Puzzle Solver", view)
+        cv2.waitKey(5)
+        
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     try:
-        pieces, shape = extract_pieces(INPUT_IMAGE)
-        if len(pieces) >= 4:
-            solution = solve_puzzle_robust(pieces)
-            if solution:
-                animate(pieces, solution, (shape[0]*2, shape[1]*2))
+        # Check if file exists before starting
+        if not os.path.exists(INPUT_IMAGE):
+             print(f"ERROR: Image not found at {INPUT_IMAGE}")
+             print("Please update the INPUT_IMAGE path at the top of the script.")
+        else:
+            pieces, _ = extract_pieces(INPUT_IMAGE)
+            if pieces:
+                print(f"Detected {len(pieces)} pieces.")
+                layout = solve_puzzle(pieces)
+                # FIX: animate now only expects 2 arguments
+                animate(pieces, layout)
             else:
-                print("Could not find solution.")
+                print("No pieces found.")
     except Exception as e:
         print(f"Error: {e}")
