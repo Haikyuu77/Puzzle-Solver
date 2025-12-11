@@ -10,11 +10,14 @@ import sys
 # ==========================================
 INPUT_IMAGE = '../images/train_irregular_translate.png'
 DEBUG_DIR = './debug_candidates/'
-MATCH_CROP = 0         
-WIDTH_TOLERANCE = 0.01  # 20% to handle uneven row splits (6 vs 7 pieces)
+MATCH_CROP = 0          
+WIDTH_TOLERANCE = 0.01  # 20% to handle uneven row splits
 
-# Horizontal: Threshold for Block MSE
-MAX_HORIZONTAL_COST = 1000.0  
+# Strictness for valid row candidates during greedy search
+MAX_HORIZONTAL_COST = 5000.0  
+
+# How many permutations to test in the final vertical check
+CANDIDATES_PER_ROW = 40
 
 MIN_ROWS_TO_CHECK = 3
 MAX_ROWS_TO_CHECK = 3 
@@ -32,115 +35,56 @@ class PuzzlePiece:
         self.lab = cv2.cvtColor(safe, cv2.COLOR_BGR2LAB).astype("float32")
 
 # ==========================================
-# 2. ADVANCED METRICS
+# 2. METRICS
 # ==========================================
-def get_block_horizontal_cost(lab1, side1, lab2, side2):
+def get_mse_cost(img1, img2):
+    """ Standard Mean Squared Error """
+    diff = img1 - img2
+    return np.mean(np.square(diff))
+
+def get_horizontal_cost(p_left, p_right):
+    """ Horizontal Pairwise Cost """
+    edge1 = p_left.lab[:, -1, :]
+    edge2 = p_right.lab[:, 0, :]
+    
+    # Align height
+    h = min(edge1.shape[0], edge2.shape[0])
+    return get_mse_cost(edge1[:h], edge2[:h])
+
+def get_vertical_strip_cost(strip_top, strip_bot):
     """ 
-    Horizontal: 4-pixel deep Block MSE.
-    Using more depth makes it robust against single-pixel noise.
+    Compare two full stitched strips.
+    Slide horizontally to find the best lock.
     """
-    # Depth of comparison
-    DEPTH = 4
+    # Bottom of Top Strip vs Top of Bottom Strip
+    edge1 = strip_top[-1, :, :]
+    edge2 = strip_bot[0, :, :]
     
-    if side1 == 'right':  
-        # Take rightmost 4 columns
-        block1 = lab1[:, -DEPTH:, :]
-    else: 
-        block1 = lab1[:, :DEPTH, :] # Should not happen for side1='right' logic
-        
-    if side2 == 'left':   
-        # Take leftmost 4 columns
-        block2 = lab2[:, :DEPTH, :]
-    else:
-        block2 = lab2[:, -DEPTH:, :]
-
-    # Align heights
-    h1 = block1.shape[0]
-    h2 = block2.shape[0]
-    length = min(h1, h2)
-    if length < 5: return float('inf')
+    w1 = edge1.shape[0]
+    w2 = edge2.shape[0]
     
-    b1 = block1[:length]
-    b2 = block2[:length]
+    # Small sliding window (allows ~10% shift) to align left edges
+    search_range = int(min(w1, w2) * 0.1)
+    min_overlap = int(min(w1, w2) * 0.9)
     
-    # Calculate MSE on the blocks
-    diff_sq = np.square(b1 - b2)
-    mse = np.mean(diff_sq)
-    
-    return mse
-
-def calculate_zncc(patch1, patch2):
-    """
-    Zero-Normalized Cross-Correlation (ZNCC).
-    Returns value between -1.0 and 1.0.
-    1.0 = Perfect pattern match (ignoring brightness shift).
-    0.0 = No correlation (random noise).
-    """
-    # Flatten arrays
-    v1 = patch1.flatten()
-    v2 = patch2.flatten()
-    
-    # Zero-Normalize (Subtract Mean)
-    v1 = v1 - np.mean(v1)
-    v2 = v2 - np.mean(v2)
-    
-    # Compute Norms
-    norm1 = np.linalg.norm(v1)
-    norm2 = np.linalg.norm(v2)
-    
-    if norm1 < 1e-6 or norm2 < 1e-6:
-        # Flat color area (no texture) -> Correlation is undefined/low
-        return 0.0
-        
-    # Correlation
-    score = np.dot(v1, v2) / (norm1 * norm2)
-    return score
-
-def get_vertical_zncc_score(row1_lab, row2_lab):
-    """ 
-    Vertical: Deep Band ZNCC.
-    Uses a deep strip of data (16 pixels) to match texture patterns.
-    Higher Score is Better.
-    """
-    # Depth of vertical overlap check
-    DEPTH = 16
-    
-    h1, w1 = row1_lab.shape[:2]
-    h2, w2 = row2_lab.shape[:2]
-    
-    # Extract bottom strip of Top Row
-    strip1 = row1_lab[-DEPTH:, :, 0] # Use L channel for structure
-    
-    # Extract top strip of Bottom Row
-    strip2 = row2_lab[:DEPTH, :, 0]
-    
-    # Allow sliding
-    search_range = int(min(w1, w2) * 0.2)
-    min_overlap = int(min(w1, w2) * 0.8)
-    
-    best_score = -1.0 # Initialize with worst possible correlation
+    best_mse = float('inf')
     
     for offset in range(-search_range, search_range + 1):
-        # Calculate overlap indices
         start1 = max(0, -offset)
         end1 = min(w1, w2 - offset)
         start2 = max(0, offset)
         end2 = min(w2, w1 + offset)
         
-        len1 = end1 - start1
-        if len1 < min_overlap: continue
+        if end1 - start1 < min_overlap: continue
             
-        s1 = strip1[:, start1:end1]
-        s2 = strip2[:, start2:end2]
-        
-        score = calculate_zncc(s1, s2)
-        
-        if score > best_score:
-            best_score = score
+        mse = get_mse_cost(edge1[start1:end1], edge2[start2:end2])
+        if mse < best_mse:
+            best_mse = mse
             
-    return best_score
+    return best_mse
 
 def stitch_row(row_pieces):
+    """ Renders list of pieces into a single image strip """
     w = sum(p.w for p in row_pieces)
     h = max(p.h for p in row_pieces)
     strip = np.zeros((h, w, 3), dtype=np.uint8)
@@ -155,141 +99,141 @@ def stitch_row(row_pieces):
     return cv2.cvtColor(safe, cv2.COLOR_BGR2LAB).astype("float32")
 
 # ==========================================
-# 3. ROW BUILDER (MBM Optimized)
+# 3. GREEDY ROW EXTRACTION
 # ==========================================
-def find_valid_rows(pieces, target_width, pairwise_costs):
-    n = len(pieces)
-    
-    # Find Mutual Best Matches
-    best_right = {}
-    best_left = {}
-    
-    for i in range(n):
-        # Right Neighbors
-        cands = []
-        for j in range(n):
-            if i == j: continue
-            cands.append((pairwise_costs[pieces[i].id][pieces[j].id], pieces[j].id))
-        cands.sort(key=lambda x: x[0])
-        best_right[pieces[i].id] = cands[0]
-        
-        # Left Neighbors
-        cands_l = []
-        for j in range(n):
-            if i == j: continue
-            cands_l.append((pairwise_costs[pieces[j].id][pieces[i].id], pieces[j].id))
-        cands_l.sort(key=lambda x: x[0])
-        best_left[pieces[i].id] = cands_l[0]
-
+def extract_best_chain(available_pieces, target_width, pairwise_costs):
+    """
+    Searches for the single best horizontal chain from the current pool.
+    Returns: List of PuzzlePiece objects (the chain)
+    """
+    # Pre-compute neighbors for speed
     neighbors_map = {}
-    for p in pieces:
+    for p in available_pieces:
         candidates = []
-        for other in pieces:
+        for other in available_pieces:
             if p.id == other.id: continue
             c = pairwise_costs[p.id][other.id]
             if c < MAX_HORIZONTAL_COST:
-                # Prioritize Mutual Matches
-                is_mutual = (best_right[p.id][1] == other.id and best_left[other.id][1] == p.id)
-                if is_mutual:
-                    c /= 100.0 
                 candidates.append((c, other))
-        
         candidates.sort(key=lambda x: x[0])
         neighbors_map[p.id] = candidates[:8]
 
-    valid_rows = []
+    valid_chains = []
     
-    def dfs_build_row(chain, current_w, remaining_ids):
+    def dfs(chain, current_w, remaining_ids):
+        # Check Width Constraint
         if abs(current_w - target_width) / target_width <= WIDTH_TOLERANCE:
-            valid_rows.append(list(chain))
+            # Calculate score
+            score = 0
+            for k in range(len(chain)-1):
+                score += pairwise_costs[chain[k].id][chain[k+1].id]
+            # Normalize score by length
+            avg_score = score / max(1, len(chain)-1)
+            valid_chains.append({'pieces': list(chain), 'score': avg_score})
         
         if current_w > target_width * (1 + WIDTH_TOLERANCE): return
 
         last_p = chain[-1]
-        best_next = neighbors_map[last_p.id]
+        best_next = neighbors_map.get(last_p.id, [])
         
         for cost, next_p in best_next:
             if next_p.id in remaining_ids:
-                dfs_build_row(chain + [next_p], current_w + next_p.w, remaining_ids - {next_p.id})
+                dfs(chain + [next_p], current_w + next_p.w, remaining_ids - {next_p.id})
 
-    print(f"  Searching for rows ~{int(target_width)}px wide...")
-    for p in pieces:
-        dfs_build_row([p], p.w, {x.id for x in pieces if x.id != p.id})
+    # Start DFS from every piece
+    for p in available_pieces:
+        rem = {x.id for x in available_pieces if x.id != p.id}
+        dfs([p], p.w, rem)
         
-    unique_rows = []
-    seen_hashes = set()
-    for row in valid_rows:
-        h = tuple(p.id for p in row)
-        if h not in seen_hashes:
-            seen_hashes.add(h)
-            unique_rows.append(row)
-    return unique_rows
+    if not valid_chains: return None
+
+    # Sort by Score (Lowest MSE is best)
+    valid_chains.sort(key=lambda x: x['score'])
+    
+    # Return the pieces of the best chain
+    return valid_chains[0]['pieces']
 
 # ==========================================
-# 4. PARTITION SOLVER (Maximizing ZNCC)
+# 4. INTRA-ROW PERMUTATION
 # ==========================================
-def solve_by_partitioning(valid_rows, target_num_rows, total_pieces):
-    row_info = []
-    for i, row in enumerate(valid_rows):
-        mask = 0
-        for p in row: mask |= (1 << p.id)
-        lab = stitch_row(row)
-        row_info.append({'mask': mask, 'pieces': row, 'lab': lab})
-
-    target_mask = (1 << total_pieces) - 1
-    found_partitions = []
-
-    def find_cover(current_selection, current_mask, start_idx):
-        if len(found_partitions) > 100: return 
-
-        if current_mask == target_mask:
-            if len(current_selection) == target_num_rows:
-                found_partitions.append(list(current_selection))
-            return
-        if len(current_selection) >= target_num_rows: return
-
-        for i in range(start_idx, len(row_info)):
-            r = row_info[i]
-            if (current_mask & r['mask']) == 0:
-                find_cover(current_selection + [r], current_mask | r['mask'], i + 1)
-
-    print(f"  > Finding disjoint row sets...")
-    find_cover([], 0, 0)
-    print(f"  > Found {len(found_partitions)} valid partitions.")
+def generate_row_candidates(piece_set):
+    """
+    Takes a set of pieces.
+    Returns Top K permutations sorted by Horizontal Coherence (MSE).
+    """
+    pieces = list(piece_set)
+    valid_candidates = []
     
-    if not found_partitions: return None, float('-inf')
-
-    print(f"  > Vertical Ordering (Maximizing ZNCC)...")
-    
-    best_overall_layout = None
-    max_overall_score = float('-inf')
-    
-    for partition in found_partitions:
-        local_best_layout = None
-        local_max_score = float('-inf')
-
-        for perm in itertools.permutations(partition):
-            total_score = 0
+    # Brute force permutations (N <= 8 is fast)
+    for perm in itertools.permutations(pieces):
+        total_h_cost = 0
+        valid = True
+        
+        for i in range(len(perm) - 1):
+            # Recalculate cost on the fly or pass matrix. 
+            # Recalc is fast enough for small N.
+            cost = get_horizontal_cost(perm[i], perm[i+1])
+            if cost > MAX_HORIZONTAL_COST:
+                valid = False
+                break
+            total_h_cost += cost
             
-            # Sum of ZNCC correlations for internal seams
-            for k in range(len(perm) - 1):
-                top_row = perm[k]
-                btm_row = perm[k+1]
+        if valid:
+            # Store data
+            lab_strip = stitch_row(perm)
+            valid_candidates.append({
+                'pieces': perm,
+                'h_score': total_h_cost,
+                'lab': lab_strip
+            })
+            
+    # Sort by lowest horizontal error
+    valid_candidates.sort(key=lambda x: x['h_score'])
+    
+    # Keep Top K
+    return valid_candidates[:CANDIDATES_PER_ROW]
+
+# ==========================================
+# 5. GLOBAL STACKING OPTIMIZATION
+# ==========================================
+def solve_global_stacking(candidate_groups):
+    """
+    candidate_groups: List of 3 lists. 
+                      Group[0] = Top K candidates for Set 1
+                      Group[1] = Top K candidates for Set 2...
+    """
+    print(f"  > Vertical Optimization: Checking stack combinations...")
+    
+    best_stack = None
+    min_total_v_score = float('inf')
+    
+    # Try all permutations of the Sets (Top/Mid/Bot)
+    for bag_perm in itertools.permutations(range(3)):
+        cands_top = candidate_groups[bag_perm[0]]
+        cands_mid = candidate_groups[bag_perm[1]]
+        cands_bot = candidate_groups[bag_perm[2]]
+        
+        # Iterate all combinations of the chosen candidates
+        for r1 in cands_top:
+            for r2 in cands_mid:
+                # Early Pruning
+                cost_1_2 = get_vertical_strip_cost(r1['lab'], r2['lab'])
+                if cost_1_2 > min_total_v_score: continue
                 
-                # ZNCC Score (Higher is Better)
-                score = get_vertical_zncc_score(top_row['lab'], btm_row['lab'])
-                total_score += score
-            
-            if total_score > local_max_score:
-                local_max_score = total_score
-                local_best_layout = [r['pieces'] for r in perm]
+                for r3 in cands_bot:
+                    cost_2_3 = get_vertical_strip_cost(r2['lab'], r3['lab'])
+                    total_v_cost = cost_1_2 + cost_2_3
+                    
+                    if total_v_cost < min_total_v_score:
+                        min_total_v_score = total_v_cost
+                        best_stack = [r1['pieces'], r2['pieces'], r3['pieces']]
+                        print(f"    > New Best Stack! V-MSE: {total_v_cost:.2f}")
 
-        if local_max_score > max_overall_score:
-            max_overall_score = local_max_score
-            best_overall_layout = local_best_layout
+    return best_stack, min_total_v_score
 
-    return best_overall_layout, max_overall_score
-
+# ==========================================
+# MAIN PIPELINE
+# ==========================================
 def extract_pieces(image_path):
     if not os.path.exists(image_path): raise FileNotFoundError(image_path)
     img = cv2.imread(image_path)
@@ -318,8 +262,10 @@ def render_full_board(final_rows):
     if not final_rows: return None
     max_w = 0; total_h = 0
     for row in final_rows:
-        w = sum(p.w for p in row); h = max(p.h for p in row)
+        w = sum(p.w for p in row)
+        h = max(p.h for p in row)
         max_w = max(max_w, w); total_h += h
+    
     canvas = np.zeros((total_h, max_w, 3), dtype=np.uint8)
     cur_y = 0
     for row in final_rows:
@@ -338,57 +284,51 @@ def solve_puzzle(pieces):
     total_pieces = len(pieces)
     print(f"Total Width: {total_width}px | Pieces: {total_pieces}")
 
-    print("Pre-calculating pairwise costs...")
+    # 0. Pre-calc Costs
     costs = np.zeros((total_pieces, total_pieces))
     for i in range(total_pieces):
         for j in range(total_pieces):
             if i != j:
-                # Use Block MSE for Horizontal
-                costs[i][j] = get_block_horizontal_cost(pieces[i].lab, 'right', pieces[j].lab, 'left')
+                costs[i][j] = get_horizontal_cost(pieces[i], pieces[j])
             else:
                 costs[i][j] = float('inf')
 
-    best_overall_layout = None
-    best_overall_score = float('-inf')
+    target_w = total_width / 3.0
+    current_pool = list(pieces)
+    bag_candidates = []
 
-    start_r = max(1, MIN_ROWS_TO_CHECK)
-    end_r = min(total_pieces, MAX_ROWS_TO_CHECK)
-    
-    for r in range(start_r, end_r + 1):
-        target_w = total_width / r
-        if target_w < max(p.w for p in pieces): continue
-        
-        print(f"\n--- Checking {r} Rows (Target Width: {int(target_w)} px) ---")
-        
-        valid_rows = find_valid_rows(pieces, target_w, costs)
-        print(f"  > Found {len(valid_rows)} potential row segments.")
-        if len(valid_rows) < r: continue
+    # 1. Greedy Row Extraction (Find Sets)
+    print("\n--- Phase 1: Extracting Row Sets (Greedy) ---")
+    for i in range(3):
+        if i == 2:
+            # Last row is simply the remainder
+            row_set = current_pool
+            print(f"  > Set 3 (Remainder): {len(row_set)} pieces")
+        else:
+            row_set = extract_best_chain(current_pool, target_w, costs)
+            if not row_set:
+                print("Failed to find valid row chain.")
+                return
             
-        row_scores = []
-        for row in valid_rows:
-            s = 0
-            for k in range(len(row)-1): s += costs[row[k].id][row[k+1].id]
-            row_scores.append((s, row))
-        row_scores.sort(key=lambda x: x[0])
-        
-        # Increased search space
-        top_rows = [x[1] for x in row_scores[:4000]] 
-        
-        layout, score = solve_by_partitioning(top_rows, r, total_pieces)
-        
-        if layout:
-            print(f"  > Valid Solution Found! ZNCC Score: {score:.2f}")
-            if score > best_overall_score:
-                best_overall_score = score
-                best_overall_layout = layout
+            # Remove from pool
+            ids = {p.id for p in row_set}
+            current_pool = [p for p in current_pool if p.id not in ids]
+            print(f"  > Set {i+1} Found: {len(row_set)} pieces")
 
-    if best_overall_layout:
+        # 2. Intra-Row Permutation (Find Best Arrangements)
+        candidates = generate_row_candidates(set(row_set))
+        print(f"    - Generated {len(candidates)} valid permutations.")
+        bag_candidates.append(candidates)
+
+    # 3. Inter-Row Optimization (Find Best Stack)
+    best_layout, score = solve_global_stacking(bag_candidates)
+
+    if best_layout:
         if os.path.exists(DEBUG_DIR): shutil.rmtree(DEBUG_DIR)
         os.makedirs(DEBUG_DIR)
-        img = render_full_board(best_overall_layout)
-        filename = f"{DEBUG_DIR}FINAL_BEST_RESULT.png"
-        cv2.imwrite(filename, img)
-        print(f"\n>>> SAVED BEST: {filename}")
+        img = render_full_board(best_layout)
+        cv2.imwrite(f"{DEBUG_DIR}FINAL_BEST_RESULT.png", img)
+        print(f"\n>>> SAVED BEST: {DEBUG_DIR}FINAL_BEST_RESULT.png")
     else:
         print("\nNo solution found.")
 
