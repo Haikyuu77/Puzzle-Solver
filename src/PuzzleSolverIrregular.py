@@ -8,13 +8,12 @@ import sys
 # ==========================================
 # CONFIGURATION
 # ==========================================
-INPUT_IMAGE = '../images/train_irregular.png'
+INPUT_IMAGE = '../images/train_irregular_translate.png'
 DEBUG_DIR = './debug_candidates/'
-MATCH_CROP = 2          
-WIDTH_TOLERANCE = 0.01  # 3% tolerance
+MATCH_CROP = 0         
+WIDTH_TOLERANCE = 0.01  # 20% to handle uneven row splits (6 vs 7 pieces)
 
-# --- TUNING ---
-# Horizontal: L2 Norm (Standard pixel difference is best for side-by-side)
+# Horizontal: Threshold for Block MSE
 MAX_HORIZONTAL_COST = 1000.0  
 
 MIN_ROWS_TO_CHECK = 3
@@ -33,93 +32,96 @@ class PuzzlePiece:
         self.lab = cv2.cvtColor(safe, cv2.COLOR_BGR2LAB).astype("float32")
 
 # ==========================================
-# 2. METRICS
+# 2. ADVANCED METRICS
 # ==========================================
-def get_horizontal_cost(lab1, side1, lab2, side2):
+def get_block_horizontal_cost(lab1, side1, lab2, side2):
     """ 
-    Horizontal: Standard L2 Difference. 
-    Side connections are usually clean cuts, so pixel diff is reliable.
+    Horizontal: 4-pixel deep Block MSE.
+    Using more depth makes it robust against single-pixel noise.
     """
-    if side1 == 'right':  edge1 = lab1[:, -1, :]; inner1 = lab1[:, -2, :]
-    if side2 == 'left':   edge2 = lab2[:, 0, :];  inner2 = lab2[:, 1, :]
+    # Depth of comparison
+    DEPTH = 4
     
-    length = min(edge1.shape[0], edge2.shape[0])
-    if length == 0: return float('inf')
-    
-    e1 = edge1[:length]
-    e2 = edge2[:length]
-    
-    # Simple L2 Norm
-    delta = np.abs(e2 - e1)
-    weighted_delta = (delta[:,0] * 1.0) + (delta[:,1] * 2.0) + (delta[:,2] * 2.0)
-    errors = np.square(weighted_delta)
-    errors.sort()
-    keep_n = int(len(errors) * 0.8)
-    if keep_n < 1: keep_n = 1
-    
-    return np.mean(errors[:keep_n])
-
-def get_hybrid_vertical_cost(edge1, inner1, edge2, inner2):
-    """
-    Vertical: HYBRID Metric (Error / Correlation).
-    
-    Logic:
-    1. Calculate Pixel Difference (L2 Error).
-    2. Calculate Gradient Correlation (Structural Match).
-    3. Cost = Error / (1 + Correlation * Weight).
-    
-    If structure matches (Correlation ~ 0.8), the cost is divided by ~5.
-    If structure doesn't match (Correlation ~ 0.0), the cost is full.
-    This allows high-error/high-structure matches (Bodies) to beat low-error/low-structure matches (Backgrounds).
-    """
-    # 1. Pixel Difference (L2)
-    delta = np.abs(edge2 - edge1)
-    dist = np.mean(np.square((delta[:,0]*1) + (delta[:,1]*2) + (delta[:,2]*2)))
-    
-    # 2. Gradient Correlation
-    g1 = edge1 - inner1
-    g2 = inner2 - edge2
-    
-    g1_flat = g1.reshape(-1) - np.mean(g1)
-    g2_flat = g2.reshape(-1) - np.mean(g2)
-    
-    norm1 = np.linalg.norm(g1_flat)
-    norm2 = np.linalg.norm(g2_flat)
-    
-    correlation = 0.0
-    if norm1 > 1e-5 and norm2 > 1e-5:
-        correlation = np.dot(g1_flat, g2_flat) / (norm1 * norm2)
+    if side1 == 'right':  
+        # Take rightmost 4 columns
+        block1 = lab1[:, -DEPTH:, :]
+    else: 
+        block1 = lab1[:, :DEPTH, :] # Should not happen for side1='right' logic
         
-    # Clip correlation 0..1 (we only care about positive structural matches)
-    correlation = max(0.0, correlation)
+    if side2 == 'left':   
+        # Take leftmost 4 columns
+        block2 = lab2[:, :DEPTH, :]
+    else:
+        block2 = lab2[:, -DEPTH:, :]
+
+    # Align heights
+    h1 = block1.shape[0]
+    h2 = block2.shape[0]
+    length = min(h1, h2)
+    if length < 5: return float('inf')
     
-    # 3. Hybrid Score
-    # Weight of 10.0 means a perfect correlation makes the match 11x cheaper.
-    # This aggressively prioritizes structural continuity.
-    score = dist / (1.0 + (correlation * 10.0))
+    b1 = block1[:length]
+    b2 = block2[:length]
     
+    # Calculate MSE on the blocks
+    diff_sq = np.square(b1 - b2)
+    mse = np.mean(diff_sq)
+    
+    return mse
+
+def calculate_zncc(patch1, patch2):
+    """
+    Zero-Normalized Cross-Correlation (ZNCC).
+    Returns value between -1.0 and 1.0.
+    1.0 = Perfect pattern match (ignoring brightness shift).
+    0.0 = No correlation (random noise).
+    """
+    # Flatten arrays
+    v1 = patch1.flatten()
+    v2 = patch2.flatten()
+    
+    # Zero-Normalize (Subtract Mean)
+    v1 = v1 - np.mean(v1)
+    v2 = v2 - np.mean(v2)
+    
+    # Compute Norms
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    
+    if norm1 < 1e-6 or norm2 < 1e-6:
+        # Flat color area (no texture) -> Correlation is undefined/low
+        return 0.0
+        
+    # Correlation
+    score = np.dot(v1, v2) / (norm1 * norm2)
     return score
 
-def get_inter_row_cost(row1_lab, row2_lab):
+def get_vertical_zncc_score(row1_lab, row2_lab):
     """ 
-    Calculates Vertical Stacking Cost using Sliding Window + Hybrid Metric.
+    Vertical: Deep Band ZNCC.
+    Uses a deep strip of data (16 pixels) to match texture patterns.
+    Higher Score is Better.
     """
-    edge1 = row1_lab[-1, :, :]
-    inner1 = row1_lab[-2, :, :] 
+    # Depth of vertical overlap check
+    DEPTH = 16
     
-    edge2 = row2_lab[0, :, :]
-    inner2 = row2_lab[1, :, :]
+    h1, w1 = row1_lab.shape[:2]
+    h2, w2 = row2_lab.shape[:2]
     
-    w1 = edge1.shape[0]
-    w2 = edge2.shape[0]
+    # Extract bottom strip of Top Row
+    strip1 = row1_lab[-DEPTH:, :, 0] # Use L channel for structure
     
-    # Allow 15% sliding
-    search_range = int(min(w1, w2) * 0.15)
+    # Extract top strip of Bottom Row
+    strip2 = row2_lab[:DEPTH, :, 0]
+    
+    # Allow sliding
+    search_range = int(min(w1, w2) * 0.2)
     min_overlap = int(min(w1, w2) * 0.8)
     
-    best_cost = float('inf')
+    best_score = -1.0 # Initialize with worst possible correlation
     
     for offset in range(-search_range, search_range + 1):
+        # Calculate overlap indices
         start1 = max(0, -offset)
         end1 = min(w1, w2 - offset)
         start2 = max(0, offset)
@@ -128,15 +130,15 @@ def get_inter_row_cost(row1_lab, row2_lab):
         len1 = end1 - start1
         if len1 < min_overlap: continue
             
-        e1 = edge1[start1:end1]; i1 = inner1[start1:end1]
-        e2 = edge2[start2:end2]; i2 = inner2[start2:end2]
+        s1 = strip1[:, start1:end1]
+        s2 = strip2[:, start2:end2]
         
-        cost = get_hybrid_vertical_cost(e1, i1, e2, i2)
+        score = calculate_zncc(s1, s2)
         
-        if cost < best_cost:
-            best_cost = cost
+        if score > best_score:
+            best_score = score
             
-    return best_cost
+    return best_score
 
 def stitch_row(row_pieces):
     w = sum(p.w for p in row_pieces)
@@ -153,9 +155,32 @@ def stitch_row(row_pieces):
     return cv2.cvtColor(safe, cv2.COLOR_BGR2LAB).astype("float32")
 
 # ==========================================
-# 3. SOLVER LOGIC
+# 3. ROW BUILDER (MBM Optimized)
 # ==========================================
 def find_valid_rows(pieces, target_width, pairwise_costs):
+    n = len(pieces)
+    
+    # Find Mutual Best Matches
+    best_right = {}
+    best_left = {}
+    
+    for i in range(n):
+        # Right Neighbors
+        cands = []
+        for j in range(n):
+            if i == j: continue
+            cands.append((pairwise_costs[pieces[i].id][pieces[j].id], pieces[j].id))
+        cands.sort(key=lambda x: x[0])
+        best_right[pieces[i].id] = cands[0]
+        
+        # Left Neighbors
+        cands_l = []
+        for j in range(n):
+            if i == j: continue
+            cands_l.append((pairwise_costs[pieces[j].id][pieces[i].id], pieces[j].id))
+        cands_l.sort(key=lambda x: x[0])
+        best_left[pieces[i].id] = cands_l[0]
+
     neighbors_map = {}
     for p in pieces:
         candidates = []
@@ -163,19 +188,26 @@ def find_valid_rows(pieces, target_width, pairwise_costs):
             if p.id == other.id: continue
             c = pairwise_costs[p.id][other.id]
             if c < MAX_HORIZONTAL_COST:
+                # Prioritize Mutual Matches
+                is_mutual = (best_right[p.id][1] == other.id and best_left[other.id][1] == p.id)
+                if is_mutual:
+                    c /= 100.0 
                 candidates.append((c, other))
+        
         candidates.sort(key=lambda x: x[0])
-        neighbors_map[p.id] = candidates[:10]
+        neighbors_map[p.id] = candidates[:8]
 
     valid_rows = []
     
     def dfs_build_row(chain, current_w, remaining_ids):
         if abs(current_w - target_width) / target_width <= WIDTH_TOLERANCE:
             valid_rows.append(list(chain))
+        
         if current_w > target_width * (1 + WIDTH_TOLERANCE): return
 
         last_p = chain[-1]
         best_next = neighbors_map[last_p.id]
+        
         for cost, next_p in best_next:
             if next_p.id in remaining_ids:
                 dfs_build_row(chain + [next_p], current_w + next_p.w, remaining_ids - {next_p.id})
@@ -193,12 +225,14 @@ def find_valid_rows(pieces, target_width, pairwise_costs):
             unique_rows.append(row)
     return unique_rows
 
+# ==========================================
+# 4. PARTITION SOLVER (Maximizing ZNCC)
+# ==========================================
 def solve_by_partitioning(valid_rows, target_num_rows, total_pieces):
     row_info = []
     for i, row in enumerate(valid_rows):
         mask = 0
         for p in row: mask |= (1 << p.id)
-        # Pre-stitch for speed
         lab = stitch_row(row)
         row_info.append({'mask': mask, 'pieces': row, 'lab': lab})
 
@@ -223,32 +257,38 @@ def solve_by_partitioning(valid_rows, target_num_rows, total_pieces):
     find_cover([], 0, 0)
     print(f"  > Found {len(found_partitions)} valid partitions.")
     
-    if not found_partitions: return None, float('inf')
+    if not found_partitions: return None, float('-inf')
 
-    print(f"  > Vertical Ordering (Brute Force Permutations)...")
-    best_layout = None
-    min_score = float('inf')
+    print(f"  > Vertical Ordering (Maximizing ZNCC)...")
     
-    # Iterate all valid groupings of rows
+    best_overall_layout = None
+    max_overall_score = float('-inf')
+    
     for partition in found_partitions:
-        # Try every vertical order: (Row A, Row B, Row C), (Row A, Row C, Row B)...
+        local_best_layout = None
+        local_max_score = float('-inf')
+
         for perm in itertools.permutations(partition):
-            score = 0
+            total_score = 0
             
-            # Check seams: 0->1, 1->2...
+            # Sum of ZNCC correlations for internal seams
             for k in range(len(perm) - 1):
                 top_row = perm[k]
                 btm_row = perm[k+1]
                 
-                # Hybrid Cost (L2 / Correlation)
-                cost = get_inter_row_cost(top_row['lab'], btm_row['lab'])
-                score += cost
+                # ZNCC Score (Higher is Better)
+                score = get_vertical_zncc_score(top_row['lab'], btm_row['lab'])
+                total_score += score
             
-            if score < min_score:
-                min_score = score
-                best_layout = [r['pieces'] for r in perm]
+            if total_score > local_max_score:
+                local_max_score = total_score
+                local_best_layout = [r['pieces'] for r in perm]
 
-    return best_layout, min_score
+        if local_max_score > max_overall_score:
+            max_overall_score = local_max_score
+            best_overall_layout = local_best_layout
+
+    return best_overall_layout, max_overall_score
 
 def extract_pieces(image_path):
     if not os.path.exists(image_path): raise FileNotFoundError(image_path)
@@ -303,12 +343,13 @@ def solve_puzzle(pieces):
     for i in range(total_pieces):
         for j in range(total_pieces):
             if i != j:
-                costs[i][j] = get_horizontal_cost(pieces[i].lab, 'right', pieces[j].lab, 'left')
+                # Use Block MSE for Horizontal
+                costs[i][j] = get_block_horizontal_cost(pieces[i].lab, 'right', pieces[j].lab, 'left')
             else:
                 costs[i][j] = float('inf')
 
     best_overall_layout = None
-    best_overall_score = float('inf')
+    best_overall_score = float('-inf')
 
     start_r = max(1, MIN_ROWS_TO_CHECK)
     end_r = min(total_pieces, MAX_ROWS_TO_CHECK)
@@ -330,14 +371,14 @@ def solve_puzzle(pieces):
             row_scores.append((s, row))
         row_scores.sort(key=lambda x: x[0])
         
-        # Keep ample candidates
-        top_rows = [x[1] for x in row_scores[:2500]] 
+        # Increased search space
+        top_rows = [x[1] for x in row_scores[:4000]] 
         
         layout, score = solve_by_partitioning(top_rows, r, total_pieces)
         
         if layout:
-            print(f"  > Valid Solution Found! Score: {score:.2f}")
-            if score < best_overall_score:
+            print(f"  > Valid Solution Found! ZNCC Score: {score:.2f}")
+            if score > best_overall_score:
                 best_overall_score = score
                 best_overall_layout = layout
 
@@ -345,9 +386,9 @@ def solve_puzzle(pieces):
         if os.path.exists(DEBUG_DIR): shutil.rmtree(DEBUG_DIR)
         os.makedirs(DEBUG_DIR)
         img = render_full_board(best_overall_layout)
-        filename = f"{DEBUG_DIR}FINAL_RESULT.png"
+        filename = f"{DEBUG_DIR}FINAL_BEST_RESULT.png"
         cv2.imwrite(filename, img)
-        print(f"\n>>> SAVED: {filename}")
+        print(f"\n>>> SAVED BEST: {filename}")
     else:
         print("\nNo solution found.")
 
