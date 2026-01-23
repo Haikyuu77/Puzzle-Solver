@@ -2,6 +2,19 @@ import numpy as np
 import cv2
 
 def animate(pieces, layout):
+    # Flip the rendered view 180° without changing piece math
+    FLIP_VIEW_180 = True
+    # Scale up visual size of pieces/canvas for display (animation only)
+    DISPLAY_SCALE = 1
+    # Seam fill (target only near-black gaps instead of closing everything)
+    SEAM_FILL = True
+    SEAM_THRESH = 8  # pixel values below this are treated as gaps
+    # Optional morph close applied only on dark seam regions
+    USE_MORPH_CLOSE = False
+    MORPH_KERNEL = 2
+    MORPH_MASK_THRESH = 8
+    MORPH_DILATE = 1
+    
     # Determine Grid Size
     n = len(pieces)
     gw = int(np.sqrt(n))
@@ -11,12 +24,14 @@ def animate(pieces, layout):
     ref_img = p0.rotations[p0.final_rotation_idx]['visual']
     piece_h, piece_w = ref_img.shape[:2]
     
-    # Calculate Final Canvas Size
-    final_w = piece_w * gw
-    final_h = piece_h * gw
+    # Calculate Final Canvas Size based on scaled pieces and grid
+    scaled_piece_w = int(piece_w * DISPLAY_SCALE)
+    scaled_piece_h = int(piece_h * DISPLAY_SCALE)
+    final_w = scaled_piece_w * gw
+    final_h = scaled_piece_h * gw
     
     # Add a visual margin
-    margin = 50
+    margin = int(200 * DISPLAY_SCALE)
     canvas_w = final_w + (margin * 2)
     canvas_h = final_h + (margin * 2)
     
@@ -26,8 +41,8 @@ def animate(pieces, layout):
     
     for i, idx in enumerate(layout):
         r, c = i // gw, i % gw
-        pieces[idx].target_x = grid_start_x + (c * piece_w) + piece_w/2
-        pieces[idx].target_y = grid_start_y + (r * piece_h) + piece_h/2
+        pieces[idx].target_x = grid_start_x + (c * scaled_piece_w) + scaled_piece_w/2
+        pieces[idx].target_y = grid_start_y + (r * scaled_piece_h) + scaled_piece_h/2
 
     # Shift Start Positions to Center (so the pile isn't off-screen)
     all_x = [p.current_x for p in pieces]
@@ -49,12 +64,21 @@ def animate(pieces, layout):
             # Interpolate
             cx = p.current_x + (p.target_x - p.current_x) * ease_val
             cy = p.current_y + (p.target_y - p.current_y) * ease_val
+            # Snap to exact targets on the final frame to avoid subpixel gaps
+            if ease_val >= 0.999:
+                cx, cy = float(p.target_x), float(p.target_y)
             
+            # Compensate the typical -90° bias from minAreaRect so starting orientation matches the source photo
             start_angle = p.detected_angle
             end_angle = p.final_rotation_idx * -90
             cur_angle = start_angle + (end_angle - start_angle) * ease_val
             
-            src_img = p.rotations[0]['visual']
+            # Pad to reduce edge artifacts during rotation
+            src_img = cv2.copyMakeBorder(
+                p.rotations[0]['visual'], 1, 1, 1, 1, cv2.BORDER_REPLICATE
+            )
+            if DISPLAY_SCALE != 1.0:
+                src_img = cv2.resize(src_img, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE, interpolation=cv2.INTER_CUBIC)
             h, w = src_img.shape[:2]
             center = (w // 2, h // 2)
             
@@ -65,8 +89,13 @@ def animate(pieces, layout):
             M[0, 2] += new_w / 2 - center[0]
             M[1, 2] += new_h / 2 - center[1]
             
-            rot_img = cv2.warpAffine(src_img, M, (new_w, new_h))
-            
+            # Only replicate borders once fully placed; keep defaults during motion
+            border_mode = cv2.BORDER_REPLICATE if ease_val >= 1.0 else cv2.BORDER_CONSTANT
+            rot_img = cv2.warpAffine(
+                src_img, M, (new_w, new_h),
+                flags=cv2.INTER_CUBIC,  # smoother edges
+                borderMode=border_mode
+            )
             tl_x = int(cx - new_w / 2)
             tl_y = int(cy - new_h / 2)
             
@@ -88,10 +117,30 @@ def animate(pieces, layout):
         
         # Smart Scaling for Display
         disp_h, disp_w = frame.shape[:2]
-        MAX_DISPLAY = 900
-        if disp_h > MAX_DISPLAY:
-            scale = MAX_DISPLAY / disp_h
-            return cv2.resize(frame, (int(disp_w * scale), MAX_DISPLAY))
+        # MAX_DISPLAY = 1000
+        # if disp_h > MAX_DISPLAY:
+        #     scale = MAX_DISPLAY / disp_h
+        #     return cv2.resize(frame, (int(disp_w * scale), MAX_DISPLAY))
+        
+        if ease_val >= 1.0:
+            # Build masks for seam/morph operations
+            seam_mask = (frame[:,:,0] < SEAM_THRESH) & (frame[:,:,1] < SEAM_THRESH) & (frame[:,:,2] < SEAM_THRESH)
+            morph_mask = (frame[:,:,0] < MORPH_MASK_THRESH) & (frame[:,:,1] < MORPH_MASK_THRESH) & (frame[:,:,2] < MORPH_MASK_THRESH)
+            if MORPH_DILATE > 0 and np.any(morph_mask):
+                k = np.ones((MORPH_DILATE, MORPH_DILATE), np.uint8)
+                morph_mask = cv2.dilate(morph_mask.astype(np.uint8), k, iterations=1).astype(bool)
+
+            if SEAM_FILL and np.any(seam_mask):
+                blurred = cv2.blur(frame, (3, 3))
+                frame[seam_mask] = blurred[seam_mask]
+
+            if USE_MORPH_CLOSE and np.any(morph_mask):
+                kernel = np.ones((MORPH_KERNEL, MORPH_KERNEL), np.uint8)
+                closed = cv2.morphologyEx(frame, cv2.MORPH_CLOSE, kernel, iterations=1)
+                frame[morph_mask] = closed[morph_mask]
+
+        if FLIP_VIEW_180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
         return frame
 
     # --- STEP 1: SHOW ORIGINAL STATE (2 SECONDS) ---

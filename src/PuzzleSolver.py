@@ -3,13 +3,13 @@ import numpy as np
 import os
 
 from PuzzlePiece import PuzzlePiece
-from Animation import animate
+from animation import animate
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 # Make sure this path is correct relative to where you run the script
-INPUT_IMAGE = '../images/starry_night_rotate.png' 
+INPUT_IMAGE = '../images/taj_rotate.png' 
 
 def extract_pieces(image_path):
     if not os.path.exists(image_path):
@@ -55,13 +55,11 @@ def extract_pieces(image_path):
     for i, p in enumerate(raw_pieces):
         # Resize to standard grid dimensions to fix minor extraction noise
         resized = cv2.resize(p['img'], (avg_w, avg_h))
-        final_pieces.append(PuzzlePiece(img, resized, p['center'], p['angle'], i))
+        # Keep original warped for animation visuals, use resized for solver math
+        final_pieces.append(PuzzlePiece(img, resized, p['center'], p['angle'], i, visual_img=p['img']))
         
     return final_pieces, img.shape
 
-# ==========================================
-# 2. ADAPTIVE METRIC
-# ==========================================
 def analyze_roughness(pieces):
     total_var = sum(p.variance for p in pieces)
     avg = total_var / len(pieces)
@@ -99,16 +97,9 @@ def calculate_score(p1, rot1, p2, rot2, relation, config):
     grad_err = np.linalg.norm(pred_1 - edge2) + np.linalg.norm(pred_2 - edge1)
     
     score = color_err + (config['grad'] * grad_err)
-    
-    # if config['dark']:
-    #     lum = (np.mean(edge1[:,0]) + np.mean(edge2[:,0])) / 2.0
-    #     if lum < 15: score *= 3.0
         
     return score
 
-# ==========================================
-# 3. GLOBAL SOLVER
-# ==========================================
 def solve_puzzle(pieces):
     n = len(pieces)
     grid_n = int(np.sqrt(n))
